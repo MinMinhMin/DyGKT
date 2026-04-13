@@ -52,6 +52,9 @@ class DyGKT(nn.Module):
             self.time_encoder = TimeEncoder(time_dim=self.time_dim)
         else:
             self.time_encoder = TimeDualDecayEncoder(time_dim=self.time_dim)# TimeEncoder(time_dim=self.time_dim)
+            self.momentum_encoder = DecayingCumulativeMomentumEncoder(
+                epsilon=1.0
+            )
         
     def set_neighbor_sampler(self,neighbor_sampler: NeighborSampler):
         self.neighbor_sampler = neighbor_sampler
