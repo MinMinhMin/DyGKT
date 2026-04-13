@@ -21,7 +21,7 @@ class DyGKT(nn.Module):
         self.ablation = ablation
 
         self.node_raw_features = torch.from_numpy(node_raw_features.astype(np.float32))#.to(device)
-        self.edge_raw_features = torch.from_numpy(edge_raw_features.astype(np.float32))#.to(device)
+        self.edge_raw_features = torch.from_numpy(edge_raw_features.astype(np.float32)).to(device)
 
         self.num_skills = int(np.unique(self.node_raw_features[:, 0]).max()) + 1
         self.num_nodes = self.node_raw_features.shape[0]
