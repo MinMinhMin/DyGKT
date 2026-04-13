@@ -102,23 +102,10 @@ class DyGKT(nn.Module):
             nodes_neighbor_ids=dst_neighbor_node_ids, nodes_neighbor_times=dst_neighbor_times)
         
 
-        # Momentum chỉ cho src (student) — cột cuối là current node, bỏ ra
-        src_nodes_momentum_features = self.momentum_encoder(
-            torch.from_numpy(src_neighbor_times[:, :-1]).float().to(self.device)
-        )  # (B, num_neighbors, node_dim)
-
-        # Pad thêm 1 bước zero cho vị trí current node để giữ shape (B, L, node_dim)
-        zero_pad = torch.zeros(
-            src_nodes_momentum_features.shape[0], 1,
-            src_nodes_momentum_features.shape[2],
-            device=self.device
-        )
-        src_nodes_momentum_features = torch.cat(
-            [src_nodes_momentum_features, zero_pad], dim=1
-        )  # (B, num_neighbors+1, node_dim)
+        
 
         
-        src_nodes_features = src_nodes_neighbor_node_raw_features + src_nodes_edge_raw_features + src_nodes_neighbor_time_features + src_nodes_momentum_features#+ src_nodes_neighbor_struct_features  # torch.cat((src_nodes_neighbor_node_raw_features, src_nodes_edge_raw_features),dim=-1) 
+        src_nodes_features = src_nodes_neighbor_node_raw_features + src_nodes_edge_raw_features + src_nodes_neighbor_time_features #+ src_nodes_neighbor_struct_features  # torch.cat((src_nodes_neighbor_node_raw_features, src_nodes_edge_raw_features),dim=-1) 
         dst_nodes_features = dst_nodes_neighbor_node_raw_features + dst_nodes_edge_raw_features + dst_nodes_neighbor_time_features #+ dst_nodes_neighbor_struct_features  # torch.cat((dst_nodes_neighbor_node_raw_features, dst_nodes_edge_raw_features), dim=-1) 
 
         src_node_embeddings = self.src_node_updater.update(
