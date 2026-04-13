@@ -1,0 +1,59 @@
+use ml_assist17.csv : graph_df (941556, 6) - with id   (,u,i,ts,label,idx
+) - u:  src_node_ids, i: dst_node_ids , u and i already unique to each other
+use ml_assist17_node.npy: node_raw_features  (12910,1) (question - kc / unique)
+use ml_assist17.npy: edge_raw_features (941556,1) (correctness)
+
+
+
+self.node_raw_features: (12910,64)
+self.edge_raw_features: (941556,64)
+
+
+instead data batch like DKT:
+S1: (Q4,R1,T1_1), (Q3,R2,T1_2), (Q1,R3,T1_3),...
+S2: (Q7,R1,T2_1), (Q2,R2,T2_2), .....
+DyGKT make batch as continuous subseqeuences of log seq with lenght = batch size, ex:
+batch size = 3 
+************
+1, S1, Q4, 1 , T1
+2, S1, Q1, 0 , T2
+3, S2, Q2, 0 , T3
+************
+4, S3, Q5, 1 , T4
+5, S2, Q3, 0 , T5
+6, S4, Q2, 1 , T6
+
+
+
+
+split dataset in 3 part by time for train/val/test prevent leakage from future
+
+
+??  (DyGKT.py)
+src_node_skill = self.node_raw_features[torch.from_numpy(src_neighbor_node_ids)][:, :-1, 0].long().to(self.device)
+dst_node_skill = self.node_raw_features[torch.from_numpy(dst_neighbor_node_ids)][:, -1, 0].long().to(self.device).unsqueeze(1).repeat(1, self.num_neighbors)
+
+src_neighbor_node_ids = list of neighbors question + student it self
+dst_neighbor_node_ids = list of neighbor student + question it self
+-> use as a mask to check if in this timestep did student have already answer a question that contain this skill (from current question) 
+src_nodes_neighbor_skill_features = (src_node_skill == dst_node_skill).unsqueeze(-1).float()
+
+
+
+
+time feature
+use TimeDualDecayEncoder to learn 2 pattern  just between 2 consecutive timestamp
+
+if Δt > 1 days or Δt <= 1 day
+
+Δt = t_(i+1) - t_i
+m = 1(Δt>1 day)
+
+short = ReLU( W_S · (Δt * m) + B_S )
+long  = ReLU( W_L · (Δt * (1 - m)) + B_L )
+
+
+output = W_o · (short + long) + B_o
+
+
+
