@@ -37,7 +37,6 @@ class DyGKT(nn.Module):
             'edge': nn.Linear(in_features=1, out_features=self.node_dim, bias=True),
             'time': nn.Linear(in_features=self.time_dim, out_features=self.node_dim, bias=True),
             'struct': nn.Linear(in_features=1, out_features=self.node_dim, bias=True),
-            'momentum': nn.Linear(in_features=2, out_features=self.node_dim, bias=True),
         })
 
         self.output_layer = nn.Linear(in_features=self.node_dim, out_features=self.node_dim, bias=True)
@@ -52,9 +51,6 @@ class DyGKT(nn.Module):
             self.time_encoder = TimeEncoder(time_dim=self.time_dim)
         else:
             self.time_encoder = TimeDualDecayEncoder(time_dim=self.time_dim)# TimeEncoder(time_dim=self.time_dim)
-            self.momentum_encoder = DecayingCumulativeMomentumEncoder(
-                epsilon=1.0
-            )
         
     def set_neighbor_sampler(self,neighbor_sampler: NeighborSampler):
         self.neighbor_sampler = neighbor_sampler
@@ -102,27 +98,13 @@ class DyGKT(nn.Module):
             nodes_neighbor_ids=dst_neighbor_node_ids, nodes_neighbor_times=dst_neighbor_times)
         
 
-        # Lấy correctness từ edge_raw_features (bao gồm cả current dummy)
-        src_neighbor_correctness = self.edge_raw_features[
-            torch.from_numpy(src_neighbor_edge_ids).to(self.device)
-        ][:, :, 0].float()   # (batch_size, num_neighbors + 1)
-
-        src_neighbor_times_tensor = torch.from_numpy(src_neighbor_times).float().to(self.device)
-
-        # Raw feature từ encoder (B, 2)
-        src_momentum_raw = self.momentum_encoder(src_neighbor_times_tensor, src_neighbor_correctness)
-
-        # Project thành node_dim feature (giống edge/time/struct)
-        src_momentum_feature = self.projection_layer['momentum'](src_momentum_raw)  # (B, node_dim)
-        # =================================================================
-
 
 
         src_nodes_features = src_nodes_neighbor_node_raw_features + src_nodes_edge_raw_features + src_nodes_neighbor_time_features #+ src_nodes_neighbor_struct_features  # torch.cat((src_nodes_neighbor_node_raw_features, src_nodes_edge_raw_features),dim=-1) 
         dst_nodes_features = dst_nodes_neighbor_node_raw_features + dst_nodes_edge_raw_features + dst_nodes_neighbor_time_features #+ dst_nodes_neighbor_struct_features  # torch.cat((dst_nodes_neighbor_node_raw_features, dst_nodes_edge_raw_features), dim=-1) 
 
         src_node_embeddings = self.src_node_updater.update(
-            src_nodes_features[:, :-1, :] + src_nodes_neighbor_skill_struct_features + src_nodes_neighbor_struct_features + src_momentum_feature.unsqueeze(1)) + (src_nodes_edge_raw_features + src_nodes_neighbor_time_features)[:,-1, :] + src_momentum_feature
+            src_nodes_features[:, :-1, :] + src_nodes_neighbor_skill_struct_features + src_nodes_neighbor_struct_features ) + (src_nodes_edge_raw_features + src_nodes_neighbor_time_features)[:,-1, :]
         
         if self.ablation in ['q_qid', 'q_kid']:
             dst_node_embeddings = dst_nodes_neighbor_node_raw_features[:,-1]
