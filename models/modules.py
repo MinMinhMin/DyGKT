@@ -3,120 +3,179 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-class SessionAwareMomentumEncoder(nn.Module):
+class RevisitPatternMomentumEncoder(nn.Module):
     """
-    Session-aware momentum encoder cho chuỗi tương tác của student.
+    Revisit Pattern Momentum Encoder.
 
-    Tách momentum thành 2 scale:
-      - Intra-session (ΔT nhỏ, cùng phiên học):
-            phản ánh trạng thái tập trung / flow state trong phiên hiện tại
-      - Inter-session (ΔT lớn, qua phiên khác):
-            phản ánh tính kiên trì quay lại học / retention consistency
+    Tư tưởng: lịch sử tương tác của student được tách thành 2 luồng có
+    ngữ nghĩa hoàn toàn khác nhau:
 
-    Mỗi scale có α learnable riêng.
-    Learned gate kết hợp hai tín hiệu theo từng bước thời gian.
+      first_encounter : lần đầu student gặp một skill
+                        → "learning curve" ban đầu
+      revisit         : các lần student quay lại skill đã gặp
+                        → "retention / re-learning trajectory"
 
-    CHỈ dùng cho src node (student) neighbors — không áp cho dst.
+    Cross-attention từ revisit → first_encounter cho phép model học:
+    "Kết quả re-learning hiện tại so với lần đầu học ra sao?"
+
+    Spacing effect (Ebbinghaus): revisit đúng thời điểm sau khi đã quên
+    tạo ra retention pattern khác biệt với student không bao giờ quên.
+    Module này cung cấp tín hiệu để model phân biệt 2 trajectory đó.
+
+    CHỈ dùng cho src node (student).
+    Output shape (B, node_dim) — cộng trực tiếp vào src_node_embeddings.
 
     Args:
-        node_dim         : chiều output, bằng node_dim trong DyGKT
-        session_threshold: ngưỡng ΔT (giây) để phân biệt intra/inter session
-                           (default 1800 = 30 phút)
-        epsilon          : floor tránh chia 0 trong 1/ΔT
+        node_dim  : chiều embedding, bằng node_dim trong DyGKT (64)
+        num_heads : số attention heads cho cross-attention
+        dropout   : dropout rate
     """
 
     def __init__(self,
-                 node_dim: int,
-                 session_threshold: float = 1800.0,
-                 epsilon: float = 1.0):
+                 node_dim : int,
+                 num_heads: int   = 4,
+                 dropout  : float = 0.1):
         super().__init__()
-        self.session_threshold = session_threshold
-        self.epsilon = epsilon
+        self.node_dim = node_dim
 
-        # α = sigmoid(raw) ∈ (0,1) — decay riêng cho từng scale
-        self.alpha_intra_raw = nn.Parameter(torch.zeros(1))
-        self.alpha_inter_raw = nn.Parameter(torch.zeros(1))
+        # Input mỗi bước: [correctness(0/1), skill_match_với_target(0/1)]
+        input_dim = 2
 
-        # Learned gate: nhận [m_intra, m_inter] scalar → weight ∈ (0,1)
-        self.gate = nn.Linear(2, 1, bias=True)
+        # GRU riêng cho từng luồng
+        self.gru_first   = nn.GRU(input_size=input_dim,
+                                   hidden_size=node_dim,
+                                   batch_first=True)
+        self.gru_revisit = nn.GRU(input_size=input_dim,
+                                   hidden_size=node_dim,
+                                   batch_first=True)
 
-        # Project scalar momentum → node_dim
-        self.proj = nn.Linear(1, node_dim, bias=True)
-        self.norm = nn.LayerNorm(node_dim)
+        # Cross-attention: revisit hidden → first_encounter sequence
+        # Query  = hidden state cuối của luồng revisit    (B, 1, D)
+        # Key/V  = toàn bộ output sequence của first_enc  (B, L, D)
+        # → "Given what re-learning looks like now,
+        #    which first-encounter steps are most relevant?"
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=node_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True
+        )
 
-    @property
-    def alpha_intra(self) -> torch.Tensor:
-        return torch.sigmoid(self.alpha_intra_raw)
+        # Learned gate: kết hợp revisit_hidden và attended_first_context
+        self.gate_fc = nn.Linear(node_dim * 2, node_dim)
+        self.norm    = nn.LayerNorm(node_dim)
+        self.drop    = nn.Dropout(dropout)
 
-    @property
-    def alpha_inter(self) -> torch.Tensor:
-        return torch.sigmoid(self.alpha_inter_raw)
+    # ── Helper ──────────────────────────────────────────────────────────
 
-    def _ema_scan(self,
-                  intensity: torch.Tensor,
-                  alpha: torch.Tensor) -> torch.Tensor:
+    def _build_masks(self,
+                     skill_ids: torch.Tensor
+                     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        EMA scan: m[i] = α · m[i-1] + (1-α) · intensity[i]
+        Vectorized causal first/revisit mask.
+
+        first_mask[b, i]   = 1  nếu skill_ids[b, i] chưa xuất hiện tại j < i
+        revisit_mask[b, i] = 1  nếu skill_ids[b, i] đã xuất hiện tại j < i
+        Cả hai = 0 tại các vị trí padding (skill_id == 0).
+
+        Complexity: O(B · L²) nhưng vectorised — ổn với L = num_neighbors ≤ 50.
 
         Args:
-            intensity : (B, L)
-            alpha     : scalar tensor
+            skill_ids : (B, L) long
         Returns:
-            momentum  : (B, L)
+            first_mask, revisit_mask : (B, L) float
         """
-        steps = [intensity[:, 0]]
-        for i in range(1, intensity.shape[1]):
-            steps.append(alpha * steps[-1] + (1.0 - alpha) * intensity[:, i])
-        return torch.stack(steps, dim=1)     # (B, L)
+        B, L     = skill_ids.shape
+        device   = skill_ids.device
 
-    def forward(self, timestamps: torch.Tensor) -> torch.Tensor:
+        # (B, L, L): matches[b, i, j] = True nếu skill[i] == skill[j]
+        matches = (skill_ids.unsqueeze(2) == skill_ids.unsqueeze(1))  # (B, L, L)
+
+        # Causal: chỉ xét j < i (strictly past)
+        causal = torch.tril(
+            torch.ones(L, L, device=device, dtype=torch.bool),
+            diagonal=-1
+        )                                                              # (L, L)
+
+        # past_matches[b, i] = True nếu skill[i] đã xuất hiện trước đó
+        past_matches = (matches & causal.unsqueeze(0)).any(dim=2)     # (B, L)
+
+        # Mask padding (skill_id == 0 là placeholder khi không có neighbor)
+        valid        = (skill_ids != 0).float()                       # (B, L)
+        first_mask   = (~past_matches).float() * valid                # (B, L)
+        revisit_mask = past_matches.float()    * valid                # (B, L)
+
+        return first_mask, revisit_mask
+
+    # ── Forward ─────────────────────────────────────────────────────────
+
+    def forward(self,
+                skill_ids  : torch.Tensor,
+                correctness: torch.Tensor,
+                dst_skill  : torch.Tensor) -> torch.Tensor:
         """
         Args:
-            timestamps    : (B, L) — src_neighbor_times[:, :-1]
-                            tức là chỉ phần lịch sử neighbor, KHÔNG gồm current node
-                            thứ tự oldest → newest
+            skill_ids   : (B, L) long  — skill id của từng src neighbor
+                          tức là node_raw_features[src_neighbor_node_ids[:,:-1], 0]
+            correctness : (B, L) float — edge_raw_features[src_neighbor_edge_ids[:,:-1], 0]
+                          0 = sai, 1 = đúng; 0 tại các vị trí padding
+            dst_skill   : (B,)   long  — skill của câu hỏi cần dự đoán
+
         Returns:
-            momentum_feat : (B, L, node_dim)
+            out : (B, node_dim) — revisit pattern momentum embedding
         """
-        B, L = timestamps.shape
+        # ── 1. Causal first/revisit masks ────────────────────────────────
+        first_mask, revisit_mask = self._build_masks(skill_ids)       # (B, L)
 
-        # ── 1. Delta T ───────────────────────────────────────────────────
-        delta_t = timestamps[:, 1:] - timestamps[:, :-1]           # (B, L-1)
-        delta_t = torch.cat([delta_t[:, :1], delta_t], dim=1)      # (B, L) pad bước đầu
-        delta_t = delta_t.abs()
+        # ── 2. Input features tại mỗi bước ──────────────────────────────
+        # Feature 1: student đúng hay sai tại bước này
+        # Feature 2: skill tại bước này có khớp với target skill không
+        #            → nhấn mạnh các bước liên quan trực tiếp đến câu hỏi hiện tại
+        skill_match = (skill_ids == dst_skill.unsqueeze(1)).float()   # (B, L)
+        x = torch.stack([correctness, skill_match], dim=-1)           # (B, L, 2)
 
-        # ── 2. Session mask ──────────────────────────────────────────────
-        # intra_mask = 1 nếu ΔT nhỏ (cùng phiên),  0 nếu qua phiên mới
-        # inter_mask = 1 nếu ΔT lớn (qua phiên),   0 nếu cùng phiên
-        intra_mask = (delta_t <= self.session_threshold).float()    # (B, L)
-        inter_mask = 1.0 - intra_mask                               # (B, L)
+        # ── 3. Masked inputs: zero-out bước không thuộc luồng ────────────
+        # GRU vẫn chạy qua toàn bộ L bước nhưng nhận zero tại
+        # các vị trí bị mask → hidden state chỉ bị ảnh hưởng bởi
+        # các bước thuộc luồng tương ứng
+        x_first   = x * first_mask.unsqueeze(-1)                      # (B, L, 2)
+        x_revisit = x * revisit_mask.unsqueeze(-1)                    # (B, L, 2)
 
-        # ── 3. Intensity per scale ───────────────────────────────────────
-        # log1p(1/ΔT) ổn định hơn 1/ΔT thuần khi ΔT rất nhỏ hoặc rất lớn
-        base_intensity = torch.log1p(
-            1.0 / (delta_t + self.epsilon)
-        )                                                            # (B, L)
+        # ── 4. GRU encoding ───────────────────────────────────────────────
+        out_first,   h_first   = self.gru_first(x_first)              # (B,L,D),(1,B,D)
+        out_revisit, h_revisit = self.gru_revisit(x_revisit)          # (B,L,D),(1,B,D)
 
-        # Zero-out các bước không thuộc scale tương ứng
-        intra_intensity = base_intensity * intra_mask               # (B, L)
-        inter_intensity = base_intensity * inter_mask               # (B, L)
+        # ── 5. Cross-attention: revisit hidden → first_encounter seq ──────
+        # Query : hidden cuối của luồng revisit  → đại diện cho
+        #         "trạng thái re-learning hiện tại của student"
+        # Key/V : output sequence của first_enc  → mỗi vị trí đại diện
+        #         cho "student học skill X lần đầu như thế nào"
+        # → Attention học: lần đầu học skill nào liên quan nhất đến
+        #   trajectory re-learning hiện tại?
+        query = h_revisit.permute(1, 0, 2)                            # (B, 1, D)
 
-        # ── 4. EMA scan riêng biệt ───────────────────────────────────────
-        m_intra = self._ema_scan(intra_intensity, self.alpha_intra) # (B, L)
-        m_inter = self._ema_scan(inter_intensity, self.alpha_inter) # (B, L)
+        # Mask các vị trí không có first_encounter thực (padding)
+        # True = bị ignore trong attention
+        key_padding_mask = (first_mask == 0)                          # (B, L)
 
-        # ── 5. Learned gate kết hợp ──────────────────────────────────────
-        # gate học từng bước xem scale nào quan trọng hơn tại thời điểm đó
-        gate_input  = torch.stack([m_intra, m_inter], dim=-1)       # (B, L, 2)
-        gate_weight = torch.sigmoid(self.gate(gate_input))          # (B, L, 1)
+        attn_out, _ = self.cross_attn(
+            query            = query,
+            key              = out_first,
+            value            = out_first,
+            key_padding_mask = key_padding_mask
+        )                                                              # (B, 1, D)
+        attn_out = attn_out.squeeze(1)                                # (B, D)
 
-        momentum = (gate_weight * m_intra.unsqueeze(-1)
-                    + (1.0 - gate_weight) * m_inter.unsqueeze(-1))  # (B, L, 1)
+        # ── 6. Learned gate kết hợp hai luồng ────────────────────────────
+        # gate học: tại bước predict này, revisit trajectory hay
+        # first-encounter context quan trọng hơn?
+        h_rev  = h_revisit.squeeze(0)                                 # (B, D)
+        gate_w = torch.sigmoid(
+            self.gate_fc(torch.cat([h_rev, attn_out], dim=-1))
+        )                                                              # (B, D)
+        out    = gate_w * h_rev + (1.0 - gate_w) * attn_out          # (B, D)
 
-        # ── 6. Project → node_dim ────────────────────────────────────────
-        feat = self.proj(momentum)                                   # (B, L, node_dim)
-        return self.norm(feat)
-
+        return self.norm(self.drop(out))                              # (B, node_dim)
 
 class multiParallelEncoder(nn.Module):
     def __init__(self, dim: int, hid_size: int):
