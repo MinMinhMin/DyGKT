@@ -115,12 +115,18 @@ class DyGKT(nn.Module):
         # dst_skill (B,) — skill của câu hỏi cần predict
         # dst_node_skill ở dòng 82 đã repeat → lấy cột đầu để về (B,)
         dst_skill_1d = dst_node_skill[:, 0]                   # (B,)
+
+        # src_neighbor_node_ids[:, :-1] : (B, num_neighbors) — bỏ current node
+        src_neighbor_ids_for_revisit = torch.from_numpy(
+            src_neighbor_node_ids[:, :-1]
+        ).long().to(self.device)                              # (B, num_neighbors)
         
         # Revisit pattern momentum — chỉ cho src (student)
         revisit_momentum = self.revisit_momentum_encoder(
             skill_ids   = src_node_skill,     # (B, num_neighbors) — tái dùng var sẵn có
             correctness = src_correctness,    # (B, num_neighbors)
             dst_skill   = dst_skill_1d        # (B,)
+            neighbor_node_ids = src_neighbor_ids_for_revisit  # (B, num_neighbors) ← thêm
         )                                     # (B, node_dim)
                                                     
 
