@@ -2,7 +2,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from utils.utils import NeighborSampler
-from models.modules import TimeEncoder, TimeDualDecayEncoder, SessionAwareMomentumEncoder
+from models.modules import TimeEncoder, TimeDualDecayEncoder, RevisitPatternMomentumEncoder
 import seaborn as sns
 
 # neighbor sampler strategy: recent
@@ -21,7 +21,7 @@ class DyGKT(nn.Module):
         self.ablation = ablation
 
         self.node_raw_features = torch.from_numpy(node_raw_features.astype(np.float32))#.to(device)
-        self.edge_raw_features = torch.from_numpy(edge_raw_features.astype(np.float32)).to(device)
+        self.edge_raw_features = torch.from_numpy(edge_raw_features.astype(np.float32))#.to(device)
 
         self.num_skills = int(np.unique(self.node_raw_features[:, 0]).max()) + 1
         self.num_nodes = self.node_raw_features.shape[0]
@@ -47,15 +47,15 @@ class DyGKT(nn.Module):
         
         self.src_node_updater = DyKT_Seq(edge_dim=self.edge_dim, node_dim=self.node_dim)
         self.dst_node_updater = DyKT_Seq(edge_dim=self.edge_dim, node_dim=self.node_dim)
+        self.revisit_momentum_encoder = RevisitPatternMomentumEncoder(
+            node_dim  = self.node_dim,   # 64
+            num_heads = 4,               # head_dim = 16, ổn với node_dim=64
+            dropout   = self.dropout
+        )
         if self.ablation == 'dual':
             self.time_encoder = TimeEncoder(time_dim=self.time_dim)
         else:
             self.time_encoder = TimeDualDecayEncoder(time_dim=self.time_dim)# TimeEncoder(time_dim=self.time_dim)
-            self.session_momentum_encoder = SessionAwareMomentumEncoder(
-                node_dim=self.node_dim,
-                session_threshold=1800.0,   # 30 phút — có thể tune thành 3600 tuỳ dataset
-                epsilon=1.0
-            )
         
     def set_neighbor_sampler(self,neighbor_sampler: NeighborSampler):
         self.neighbor_sampler = neighbor_sampler
@@ -103,27 +103,34 @@ class DyGKT(nn.Module):
             nodes_neighbor_ids=dst_neighbor_node_ids, nodes_neighbor_times=dst_neighbor_times)
 
 
-        src_session_momentum = self.session_momentum_encoder(
-            torch.from_numpy(src_neighbor_times[:, :-1]).float().to(self.device)
-        )   # (B, num_neighbors, node_dim)
+
+        # src_node_skill : (B, num_neighbors) — đã computed ở dòng 81, tái sử dụng
+
+        # Correctness của từng bước trong lịch sử src neighbor
+        # edge_raw_features[:, 0] = correctness (0/1); 0 tại padding positions
+        src_correctness = self.edge_raw_features[
+            torch.from_numpy(src_neighbor_edge_ids[:, :-1])   # bỏ cột current node
+        ].to(self.device)[:, :, 0]                            # (B, num_neighbors)
         
-        # Pad zero cho vị trí current node để giữ shape khớp với sequence
-        zero_pad = torch.zeros(
-            src_session_momentum.shape[0], 1, src_session_momentum.shape[2],
-            device=self.device
-        )
-        src_session_momentum = torch.cat(
-            [src_session_momentum, zero_pad], dim=1
-        )   # (B, num_neighbors+1, node_dim)
+        # dst_skill (B,) — skill của câu hỏi cần predict
+        # dst_node_skill ở dòng 82 đã repeat → lấy cột đầu để về (B,)
+        dst_skill_1d = dst_node_skill[:, 0]                   # (B,)
+        
+        # Revisit pattern momentum — chỉ cho src (student)
+        revisit_momentum = self.revisit_momentum_encoder(
+            skill_ids   = src_node_skill,     # (B, num_neighbors) — tái dùng var sẵn có
+            correctness = src_correctness,    # (B, num_neighbors)
+            dst_skill   = dst_skill_1d        # (B,)
+        )                                     # (B, node_dim)
+                                                    
 
-
-
-        src_nodes_features = src_nodes_neighbor_node_raw_features + src_nodes_edge_raw_features + src_nodes_neighbor_time_features + src_session_momentum #+ src_nodes_neighbor_struct_features  # torch.cat((src_nodes_neighbor_node_raw_features, src_nodes_edge_raw_features),dim=-1) 
+        src_nodes_features = src_nodes_neighbor_node_raw_features + src_nodes_edge_raw_features + src_nodes_neighbor_time_features #+ src_nodes_neighbor_struct_features  # torch.cat((src_nodes_neighbor_node_raw_features, src_nodes_edge_raw_features),dim=-1) 
         dst_nodes_features = dst_nodes_neighbor_node_raw_features + dst_nodes_edge_raw_features + dst_nodes_neighbor_time_features #+ dst_nodes_neighbor_struct_features  # torch.cat((dst_nodes_neighbor_node_raw_features, dst_nodes_edge_raw_features), dim=-1) 
 
         src_node_embeddings = self.src_node_updater.update(
-            src_nodes_features[:, :-1, :] + src_nodes_neighbor_skill_struct_features + src_nodes_neighbor_struct_features ) + (src_nodes_edge_raw_features + src_nodes_neighbor_time_features + src_session_momentum)[:,-1, :]
-        
+            src_nodes_features[:, :-1, :] + src_nodes_neighbor_skill_struct_features + src_nodes_neighbor_struct_features ) + (src_nodes_edge_raw_features + src_nodes_neighbor_time_features )[:,-1, :]
+
+        src_node_embeddings = src_node_embeddings + revisit_momentum
         if self.ablation in ['q_qid', 'q_kid']:
             dst_node_embeddings = dst_nodes_neighbor_node_raw_features[:,-1]
         else:
