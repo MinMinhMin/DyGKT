@@ -68,114 +68,87 @@ class RevisitPatternMomentumEncoder(nn.Module):
 
     # ── Helper ──────────────────────────────────────────────────────────
 
-    def _build_masks(self,
-                     skill_ids: torch.Tensor
+   def _build_masks(self,
+                     skill_ids       : torch.Tensor,
+                     neighbor_node_ids: torch.Tensor
                      ) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Vectorized causal first/revisit mask.
-
-        first_mask[b, i]   = 1  nếu skill_ids[b, i] chưa xuất hiện tại j < i
-        revisit_mask[b, i] = 1  nếu skill_ids[b, i] đã xuất hiện tại j < i
-        Cả hai = 0 tại các vị trí padding (skill_id == 0).
-
-        Complexity: O(B · L²) nhưng vectorised — ổn với L = num_neighbors ≤ 50.
-
-        Args:
-            skill_ids : (B, L) long
-        Returns:
-            first_mask, revisit_mask : (B, L) float
+        neighbor_node_ids : (B, L) long — dùng để detect padding (node_id == 0)
+                            thay vì skill_id == 0, tránh nhầm skill hợp lệ
         """
-        B, L     = skill_ids.shape
-        device   = skill_ids.device
-
-        # (B, L, L): matches[b, i, j] = True nếu skill[i] == skill[j]
-        matches = (skill_ids.unsqueeze(2) == skill_ids.unsqueeze(1))  # (B, L, L)
-
-        # Causal: chỉ xét j < i (strictly past)
-        causal = torch.tril(
-            torch.ones(L, L, device=device, dtype=torch.bool),
-            diagonal=-1
-        )                                                              # (L, L)
-
-        # past_matches[b, i] = True nếu skill[i] đã xuất hiện trước đó
-        past_matches = (matches & causal.unsqueeze(0)).any(dim=2)     # (B, L)
-
-        # Mask padding (skill_id == 0 là placeholder khi không có neighbor)
-        valid        = (skill_ids != 0).float()                       # (B, L)
-        first_mask   = (~past_matches).float() * valid                # (B, L)
-        revisit_mask = past_matches.float()    * valid                # (B, L)
-
+        B, L   = skill_ids.shape
+        device = skill_ids.device
+    
+        matches = (skill_ids.unsqueeze(2) == skill_ids.unsqueeze(1))      # (B,L,L)
+        causal  = torch.tril(
+            torch.ones(L, L, device=device, dtype=torch.bool), diagonal=-1
+        )
+        past_matches = (matches & causal.unsqueeze(0)).any(dim=2)         # (B,L)
+    
+        # Dùng node_id == 0 để detect padding, không phải skill_id
+        valid        = (neighbor_node_ids != 0).float()                   # (B,L)
+        first_mask   = (~past_matches).float() * valid
+        revisit_mask = past_matches.float()    * valid
+    
         return first_mask, revisit_mask
 
     # ── Forward ─────────────────────────────────────────────────────────
 
     def forward(self,
-                skill_ids  : torch.Tensor,
-                correctness: torch.Tensor,
-                dst_skill  : torch.Tensor) -> torch.Tensor:
+                skill_ids        : torch.Tensor,
+                correctness      : torch.Tensor,
+                dst_skill        : torch.Tensor,
+                neighbor_node_ids: torch.Tensor) -> torch.Tensor:   # ← thêm param
         """
-        Args:
-            skill_ids   : (B, L) long  — skill id của từng src neighbor
-                          tức là node_raw_features[src_neighbor_node_ids[:,:-1], 0]
-            correctness : (B, L) float — edge_raw_features[src_neighbor_edge_ids[:,:-1], 0]
-                          0 = sai, 1 = đúng; 0 tại các vị trí padding
-            dst_skill   : (B,)   long  — skill của câu hỏi cần dự đoán
-
-        Returns:
-            out : (B, node_dim) — revisit pattern momentum embedding
+        neighbor_node_ids : (B, L) long — src_neighbor_node_ids[:, :-1]
+                            dùng để detect padding positions
         """
-        # ── 1. Causal first/revisit masks ────────────────────────────────
-        first_mask, revisit_mask = self._build_masks(skill_ids)       # (B, L)
-
-        # ── 2. Input features tại mỗi bước ──────────────────────────────
-        # Feature 1: student đúng hay sai tại bước này
-        # Feature 2: skill tại bước này có khớp với target skill không
-        #            → nhấn mạnh các bước liên quan trực tiếp đến câu hỏi hiện tại
-        skill_match = (skill_ids == dst_skill.unsqueeze(1)).float()   # (B, L)
-        x = torch.stack([correctness, skill_match], dim=-1)           # (B, L, 2)
-
-        # ── 3. Masked inputs: zero-out bước không thuộc luồng ────────────
-        # GRU vẫn chạy qua toàn bộ L bước nhưng nhận zero tại
-        # các vị trí bị mask → hidden state chỉ bị ảnh hưởng bởi
-        # các bước thuộc luồng tương ứng
-        x_first   = x * first_mask.unsqueeze(-1)                      # (B, L, 2)
-        x_revisit = x * revisit_mask.unsqueeze(-1)                    # (B, L, 2)
-
+        B, L = skill_ids.shape
+    
+        # ── 1. Masks ─────────────────────────────────────────────────────
+        first_mask, revisit_mask = self._build_masks(
+            skill_ids, neighbor_node_ids
+        )
+    
+        # ── 2. Input features ────────────────────────────────────────────
+        skill_match = (skill_ids == dst_skill.unsqueeze(1)).float()
+        x           = torch.stack([correctness, skill_match], dim=-1)     # (B,L,2)
+    
+        # ── 3. Masked streams ─────────────────────────────────────────────
+        x_first   = x * first_mask.unsqueeze(-1)
+        x_revisit = x * revisit_mask.unsqueeze(-1)
+    
         # ── 4. GRU encoding ───────────────────────────────────────────────
-        out_first,   h_first   = self.gru_first(x_first)              # (B,L,D),(1,B,D)
-        out_revisit, h_revisit = self.gru_revisit(x_revisit)          # (B,L,D),(1,B,D)
-
-        # ── 5. Cross-attention: revisit hidden → first_encounter seq ──────
-        # Query : hidden cuối của luồng revisit  → đại diện cho
-        #         "trạng thái re-learning hiện tại của student"
-        # Key/V : output sequence của first_enc  → mỗi vị trí đại diện
-        #         cho "student học skill X lần đầu như thế nào"
-        # → Attention học: lần đầu học skill nào liên quan nhất đến
-        #   trajectory re-learning hiện tại?
-        query = h_revisit.permute(1, 0, 2)                            # (B, 1, D)
-
-        # Mask các vị trí không có first_encounter thực (padding)
-        # True = bị ignore trong attention
-        key_padding_mask = (first_mask == 0)                          # (B, L)
-
+        out_first,   h_first   = self.gru_first(x_first)
+        out_revisit, h_revisit = self.gru_revisit(x_revisit)
+    
+        # ── 5. Cross-attention với safety guard ───────────────────────────
+        query            = h_revisit.permute(1, 0, 2)                     # (B,1,D)
+        key_padding_mask = (first_mask == 0)                              # (B,L)
+    
+        # SAFETY: nếu một batch element không có first_encounter nào hợp lệ
+        # (toàn padding) → force unmask vị trí 0 để tránh softmax(all -inf) = NaN
+        all_masked = key_padding_mask.all(dim=1)                          # (B,)
+        if all_masked.any():
+            key_padding_mask = key_padding_mask.clone()
+            key_padding_mask[all_masked, 0] = False
+    
         attn_out, _ = self.cross_attn(
             query            = query,
             key              = out_first,
             value            = out_first,
             key_padding_mask = key_padding_mask
-        )                                                              # (B, 1, D)
-        attn_out = attn_out.squeeze(1)                                # (B, D)
-
-        # ── 6. Learned gate kết hợp hai luồng ────────────────────────────
-        # gate học: tại bước predict này, revisit trajectory hay
-        # first-encounter context quan trọng hơn?
-        h_rev  = h_revisit.squeeze(0)                                 # (B, D)
+        )
+        attn_out = attn_out.squeeze(1)                                    # (B,D)
+    
+        # ── 6. Gate combine ───────────────────────────────────────────────
+        h_rev  = h_revisit.squeeze(0)
         gate_w = torch.sigmoid(
             self.gate_fc(torch.cat([h_rev, attn_out], dim=-1))
-        )                                                              # (B, D)
-        out    = gate_w * h_rev + (1.0 - gate_w) * attn_out          # (B, D)
-
-        return self.norm(self.drop(out))                              # (B, node_dim)
+        )
+        out    = gate_w * h_rev + (1.0 - gate_w) * attn_out
+    
+        return self.norm(self.drop(out))
 
 class multiParallelEncoder(nn.Module):
     def __init__(self, dim: int, hid_size: int):
