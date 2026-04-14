@@ -125,7 +125,7 @@ class DyGKT(nn.Module):
         revisit_momentum = self.revisit_momentum_encoder(
             skill_ids   = src_node_skill,     # (B, num_neighbors) — tái dùng var sẵn có
             correctness = src_correctness,    # (B, num_neighbors)
-            dst_skill   = dst_skill_1d        # (B,)
+            dst_skill   = dst_skill_1d,       # (B,)
             neighbor_node_ids = src_neighbor_ids_for_revisit  # (B, num_neighbors) ← thêm
         )                                     # (B, node_dim)
                                                     
