@@ -4,48 +4,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-
-class DecayingCumulativeMomentumEncoder(nn.Module):
-    def __init__(self, epsilon: float = 1.0):
-        """
-        Forgetting Momentum Encoder (Ebbinghaus).
-        Output là raw feature (B, 2) = [momentum_correct, momentum_wrong].
-        KHÔNG project thành node_dim ở đây nữa → để DyGKT tự projection và add vào src_node_feature.
-        Chỉ tính trên src_neighbor (history của học sinh), không dùng dst.
-        """
-        super(DecayingCumulativeMomentumEncoder, self).__init__()
-        self.epsilon = epsilon
-
-    def forward(self, timestamps: torch.Tensor, correctness: torch.Tensor):
-        """
-        :param timestamps:  (batch_size, num_neighbors + 1)
-        :param correctness: (batch_size, num_neighbors + 1), correctness ∈ {0, 1}
-        :return: raw_momentum_feature (batch_size, 2)
-        """
-        # Chỉ dùng history (bỏ current interaction)
-        past_timestamps = timestamps[:, :-1]                    # (B, num_neighbors)
-        past_correctness = correctness[:, :-1].float()          # (B, num_neighbors)
-
-        current_timestamps = timestamps[:, -1].unsqueeze(1)     # (B, 1)
-
-        delta_t = current_timestamps - past_timestamps
-        delta_t = torch.clamp(delta_t, min=1e-6)
-
-        # Hai luồng song song (correct vs wrong)
-        correct_mask = (past_correctness > 0.5).float()
-        wrong_mask = 1.0 - correct_mask
-
-        correct_intensity = correct_mask / (delta_t + self.epsilon)
-        wrong_intensity = wrong_mask / (delta_t + self.epsilon)
-
-        # Cumulative momentum
-        momentum_correct = torch.sum(correct_intensity, dim=1, keepdim=True)  # (B, 1)
-        momentum_wrong = torch.sum(wrong_intensity, dim=1, keepdim=True)      # (B, 1)
-
-        # Raw feature (chỉ là 2 scalars)
-        return torch.cat([momentum_correct, momentum_wrong], dim=1)           # (B, 2)
-
-
 class multiParallelEncoder(nn.Module):
     def __init__(self, dim: int, hid_size: int):
         super(multiParallelEncoder,self).__init__()
