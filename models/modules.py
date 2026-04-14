@@ -65,7 +65,7 @@ class RevisitPatternMomentumEncoder(nn.Module):
 
     # ── Helper ──────────────────────────────────────────────────────────
 
-   def _build_masks(self, skill_ids : torch.Tensor, neighbor_node_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def _build_masks(self, skill_ids : torch.Tensor, neighbor_node_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
         neighbor_node_ids : (B, L) long — dùng để detect padding (node_id == 0)
                             thay vì skill_id == 0, tránh nhầm skill hợp lệ
