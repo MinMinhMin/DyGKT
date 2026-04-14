@@ -122,7 +122,7 @@ class DyGKT(nn.Module):
         dst_nodes_features = dst_nodes_neighbor_node_raw_features + dst_nodes_edge_raw_features + dst_nodes_neighbor_time_features #+ dst_nodes_neighbor_struct_features  # torch.cat((dst_nodes_neighbor_node_raw_features, dst_nodes_edge_raw_features), dim=-1) 
 
         src_node_embeddings = self.src_node_updater.update(
-            src_nodes_features[:, :-1, :] + src_nodes_neighbor_skill_struct_features+ src_nodes_neighbor_struct_features) + (src_nodes_edge_raw_features + src_nodes_neighbor_time_features)[:,-1, :]
+            src_nodes_features[:, :-1, :] + src_nodes_neighbor_skill_struct_features+ src_nodes_neighbor_struct_features) + (src_nodes_edge_raw_features + src_nodes_neighbor_time_features + src_nodes_momentum_features)[:,-1, :]
         
         if self.ablation in ['q_qid', 'q_kid']:
             dst_node_embeddings = dst_nodes_neighbor_node_raw_features[:,-1]
