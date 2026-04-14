@@ -31,10 +31,7 @@ class RevisitPatternMomentumEncoder(nn.Module):
         dropout   : dropout rate
     """
 
-    def __init__(self,
-                 node_dim : int,
-                 num_heads: int   = 4,
-                 dropout  : float = 0.1):
+    def __init__(self, node_dim : int, num_heads: int   = 4, dropout  : float = 0.1):
         super().__init__()
         self.node_dim = node_dim
 
@@ -68,10 +65,7 @@ class RevisitPatternMomentumEncoder(nn.Module):
 
     # ── Helper ──────────────────────────────────────────────────────────
 
-   def _build_masks(self,
-                     skill_ids       : torch.Tensor,
-                     neighbor_node_ids: torch.Tensor
-                     ) -> tuple[torch.Tensor, torch.Tensor]:
+   def _build_masks(self, skill_ids : torch.Tensor, neighbor_node_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
         neighbor_node_ids : (B, L) long — dùng để detect padding (node_id == 0)
                             thay vì skill_id == 0, tránh nhầm skill hợp lệ
@@ -94,11 +88,7 @@ class RevisitPatternMomentumEncoder(nn.Module):
 
     # ── Forward ─────────────────────────────────────────────────────────
 
-    def forward(self,
-                skill_ids        : torch.Tensor,
-                correctness      : torch.Tensor,
-                dst_skill        : torch.Tensor,
-                neighbor_node_ids: torch.Tensor) -> torch.Tensor:   # ← thêm param
+    def forward(self, skill_ids : torch.Tensor, correctness : torch.Tensor, dst_skill : torch.Tensor, neighbor_node_ids: torch.Tensor) -> torch.Tensor:   # ← thêm param
         """
         neighbor_node_ids : (B, L) long — src_neighbor_node_ids[:, :-1]
                             dùng để detect padding positions
