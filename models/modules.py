@@ -3,6 +3,120 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+class SessionAwareMomentumEncoder(nn.Module):
+    """
+    Session-aware momentum encoder cho chuỗi tương tác của student.
+
+    Tách momentum thành 2 scale:
+      - Intra-session (ΔT nhỏ, cùng phiên học):
+            phản ánh trạng thái tập trung / flow state trong phiên hiện tại
+      - Inter-session (ΔT lớn, qua phiên khác):
+            phản ánh tính kiên trì quay lại học / retention consistency
+
+    Mỗi scale có α learnable riêng.
+    Learned gate kết hợp hai tín hiệu theo từng bước thời gian.
+
+    CHỈ dùng cho src node (student) neighbors — không áp cho dst.
+
+    Args:
+        node_dim         : chiều output, bằng node_dim trong DyGKT
+        session_threshold: ngưỡng ΔT (giây) để phân biệt intra/inter session
+                           (default 1800 = 30 phút)
+        epsilon          : floor tránh chia 0 trong 1/ΔT
+    """
+
+    def __init__(self,
+                 node_dim: int,
+                 session_threshold: float = 1800.0,
+                 epsilon: float = 1.0):
+        super().__init__()
+        self.session_threshold = session_threshold
+        self.epsilon = epsilon
+
+        # α = sigmoid(raw) ∈ (0,1) — decay riêng cho từng scale
+        self.alpha_intra_raw = nn.Parameter(torch.zeros(1))
+        self.alpha_inter_raw = nn.Parameter(torch.zeros(1))
+
+        # Learned gate: nhận [m_intra, m_inter] scalar → weight ∈ (0,1)
+        self.gate = nn.Linear(2, 1, bias=True)
+
+        # Project scalar momentum → node_dim
+        self.proj = nn.Linear(1, node_dim, bias=True)
+        self.norm = nn.LayerNorm(node_dim)
+
+    @property
+    def alpha_intra(self) -> torch.Tensor:
+        return torch.sigmoid(self.alpha_intra_raw)
+
+    @property
+    def alpha_inter(self) -> torch.Tensor:
+        return torch.sigmoid(self.alpha_inter_raw)
+
+    def _ema_scan(self,
+                  intensity: torch.Tensor,
+                  alpha: torch.Tensor) -> torch.Tensor:
+        """
+        EMA scan: m[i] = α · m[i-1] + (1-α) · intensity[i]
+
+        Args:
+            intensity : (B, L)
+            alpha     : scalar tensor
+        Returns:
+            momentum  : (B, L)
+        """
+        steps = [intensity[:, 0]]
+        for i in range(1, intensity.shape[1]):
+            steps.append(alpha * steps[-1] + (1.0 - alpha) * intensity[:, i])
+        return torch.stack(steps, dim=1)     # (B, L)
+
+    def forward(self, timestamps: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            timestamps    : (B, L) — src_neighbor_times[:, :-1]
+                            tức là chỉ phần lịch sử neighbor, KHÔNG gồm current node
+                            thứ tự oldest → newest
+        Returns:
+            momentum_feat : (B, L, node_dim)
+        """
+        B, L = timestamps.shape
+
+        # ── 1. Delta T ───────────────────────────────────────────────────
+        delta_t = timestamps[:, 1:] - timestamps[:, :-1]           # (B, L-1)
+        delta_t = torch.cat([delta_t[:, :1], delta_t], dim=1)      # (B, L) pad bước đầu
+        delta_t = delta_t.abs()
+
+        # ── 2. Session mask ──────────────────────────────────────────────
+        # intra_mask = 1 nếu ΔT nhỏ (cùng phiên),  0 nếu qua phiên mới
+        # inter_mask = 1 nếu ΔT lớn (qua phiên),   0 nếu cùng phiên
+        intra_mask = (delta_t <= self.session_threshold).float()    # (B, L)
+        inter_mask = 1.0 - intra_mask                               # (B, L)
+
+        # ── 3. Intensity per scale ───────────────────────────────────────
+        # log1p(1/ΔT) ổn định hơn 1/ΔT thuần khi ΔT rất nhỏ hoặc rất lớn
+        base_intensity = torch.log1p(
+            1.0 / (delta_t + self.epsilon)
+        )                                                            # (B, L)
+
+        # Zero-out các bước không thuộc scale tương ứng
+        intra_intensity = base_intensity * intra_mask               # (B, L)
+        inter_intensity = base_intensity * inter_mask               # (B, L)
+
+        # ── 4. EMA scan riêng biệt ───────────────────────────────────────
+        m_intra = self._ema_scan(intra_intensity, self.alpha_intra) # (B, L)
+        m_inter = self._ema_scan(inter_intensity, self.alpha_inter) # (B, L)
+
+        # ── 5. Learned gate kết hợp ──────────────────────────────────────
+        # gate học từng bước xem scale nào quan trọng hơn tại thời điểm đó
+        gate_input  = torch.stack([m_intra, m_inter], dim=-1)       # (B, L, 2)
+        gate_weight = torch.sigmoid(self.gate(gate_input))          # (B, L, 1)
+
+        momentum = (gate_weight * m_intra.unsqueeze(-1)
+                    + (1.0 - gate_weight) * m_inter.unsqueeze(-1))  # (B, L, 1)
+
+        # ── 6. Project → node_dim ────────────────────────────────────────
+        feat = self.proj(momentum)                                   # (B, L, node_dim)
+        return self.norm(feat)
+
 
 class multiParallelEncoder(nn.Module):
     def __init__(self, dim: int, hid_size: int):
